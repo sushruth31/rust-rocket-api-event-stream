@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate rocket;
 
+use chrono::Utc;
 use hmac::{Hmac, Mac};
 use jwt::SignWithKey;
 use jwt::VerifyWithKey;
@@ -9,16 +10,20 @@ use rocket::form::Form;
 use rocket::outcome::Outcome;
 use rocket::request::FromRequest;
 use rocket::response::stream::{Event, EventStream};
+use rocket::serde::json::json;
 use rocket::serde::json::serde_json;
 use rocket::Config;
+use rocket::Request;
 use rocket::State;
 use rocket::{
     serde::{Deserialize, Serialize},
     tokio::sync::broadcast::{channel, Sender},
 };
-use rocket::{Data, Request, Response};
 use sha2::Sha256;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 #[derive(Clone, Debug, FromForm, Serialize, Deserialize)]
 #[serde(crate = "rocket::serde")]
@@ -42,6 +47,7 @@ struct User {
     uid: String,
     name: String,
     token: String,
+    refresh_token: String,
 }
 
 #[derive(Clone, Debug, FromForm, Serialize, Deserialize)]
@@ -53,6 +59,7 @@ struct UserWoToken {
 }
 
 const SECRET: &[u8] = b"secret";
+const REFRESH_TOKEN_SECRET: &[u8] = b"refresh_token_secret";
 
 async fn validate_user<'a>(uid: &'a str, password: &'a str) -> Option<UserWoToken> {
     let users: Vec<UserWoToken> = vec![
@@ -82,19 +89,32 @@ async fn validate_user<'a>(uid: &'a str, password: &'a str) -> Option<UserWoToke
     }
 }
 
+fn create_jwt_token(uid: &str, secret: &[u8]) -> String {
+    let key = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+    let mut claims = BTreeMap::new();
+    claims.insert("sub", uid);
+    let exp = (Utc::now().timestamp() + 43200).to_string();
+    claims.insert("iat", &exp);
+    claims.sign_with_key(&key).unwrap()
+}
+
 impl User {
-    async fn new(user: &UserWoToken) -> Result<Self, String> {
+    async fn new(user: &UserWoToken, token_map: &State<TokenMap>) -> Result<Self, String> {
         let UserWoToken { uid, password, .. } = user;
         if let Some(user) = validate_user(uid, password).await {
             //return found user with token
-            let key: Hmac<Sha256> = Hmac::new_from_slice(SECRET).unwrap();
-            let mut claims = BTreeMap::new();
-            claims.insert("sub", uid);
-            let token_str = claims.sign_with_key(&key).unwrap();
+            let token = create_jwt_token(&user.uid, SECRET);
+            let refresh_token = create_jwt_token(&user.uid, REFRESH_TOKEN_SECRET);
+            //write token to map
+            token_map
+                .lock()
+                .unwrap()
+                .insert(refresh_token.clone(), token.clone());
             Ok(User {
                 uid: user.uid.clone(),
                 name: user.name,
-                token: token_str,
+                token,
+                refresh_token,
             })
         } else {
             Err("User not found".to_string())
@@ -104,19 +124,31 @@ impl User {
 
 //login route to get a token
 #[post("/login", data = "<user>")]
-async fn login(user: Form<UserWoToken>) -> String {
-    match User::new(&user).await {
+async fn login(user: Form<UserWoToken>, token_map: &State<TokenMap>) -> String {
+    match User::new(&user, token_map).await {
         Ok(user) => serde_json::to_string(&user).unwrap(),
-        Err(e) => serde_json::to_string(&e).unwrap(),
+        Err(e) => e,
+    }
+}
+
+//refresh token route
+#[post("/refresh", data = "<refresh_token>")]
+fn refresh(refresh_token: Form<String>, token_map: &State<TokenMap>) -> serde_json::Value {
+    let mut token_map = token_map.lock().unwrap();
+    let old_refresh_token = refresh_token.into_inner();
+    match token_map.get(&old_refresh_token) {
+        Some(token) => {
+            let new_token = create_jwt_token(&token, SECRET);
+            //update token in map
+            token_map.insert(old_refresh_token, new_token.clone());
+            json!({ "token": new_token })
+        }
+        None => json!({ "error": "refresh token not found" }),
     }
 }
 
 #[post("/message", data = "<form>")]
-fn post(
-    form: Form<Message>,
-    sender: &State<Sender<Message>>,
-    _uid: JWT,
-) -> rocket::serde::json::Value {
+fn post(form: Form<Message>, sender: &State<Sender<Message>>, uid: JWT) -> serde_json::Value {
     let form = form.into_inner();
     //may fail if no one is listening
     let res = sender.send(form.clone());
@@ -163,8 +195,30 @@ impl<'r> FromRequest<'r> for JWT {
         let key: Hmac<Sha256> = Hmac::new_from_slice(SECRET).unwrap();
         let claims: BTreeMap<String, String> = token_str.verify_with_key(&key).unwrap();
         let uid = claims.get("sub").unwrap().to_owned();
+        //check if token is expired
+        let exp = claims
+            .get("iat")
+            .unwrap()
+            .to_owned()
+            .parse::<i64>()
+            .unwrap();
+        let now = Utc::now().timestamp();
+        if exp < now {
+            return Outcome::Failure((
+                rocket::http::Status::Unauthorized,
+                "Token expired".to_string(),
+            ));
+        }
         Outcome::Success(JWT(uid))
     }
+}
+
+//state to hold the list of refresh tokens
+//ideally this should be a database
+type TokenMap = Arc<Mutex<HashMap<String, String>>>;
+
+struct RefreshTokens {
+    tokens: TokenMap,
 }
 
 fn rocket() -> rocket::Rocket<rocket::Build> {
@@ -173,10 +227,12 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
 
     let _config: Config = figment.extract().expect("config");
 
-    // Store the typed config in managed state
     rocket
-        .mount("/", routes![test, login, post, stream])
+        .mount("/", routes![test, login, post, stream, refresh])
         .manage(channel::<Message>(1024).0)
+        .manage(RefreshTokens {
+            tokens: Arc::new(Mutex::new(HashMap::new())),
+        })
         .attach(AdHoc::config::<Config>())
 }
 
