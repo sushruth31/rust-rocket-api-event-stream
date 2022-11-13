@@ -147,14 +147,20 @@ impl<'r> FromRequest<'r> for JWT {
     type Error = String;
     async fn from_request(req: &'r Request<'_>) -> rocket::request::Outcome<Self, Self::Error> {
         let token = req.headers().get_one("Authorization");
-        if token.is_none() {
-            return Outcome::Failure((
-                rocket::http::Status::Unauthorized,
-                String::from("No token"),
-            ));
+        //strip the bearer part
+        let token_str = match token {
+            Some(token) => token[7..].to_string(),
+            None => {
+                return Outcome::Failure((
+                    rocket::http::Status::Unauthorized,
+                    "No token".to_string(),
+                ))
+            }
+        };
+        if token_str.is_empty() {
+            return Outcome::Failure((rocket::http::Status::Unauthorized, "No token".to_string()));
         }
         let key: Hmac<Sha256> = Hmac::new_from_slice(SECRET).unwrap();
-        let token_str = token.unwrap();
         let claims: BTreeMap<String, String> = token_str.verify_with_key(&key).unwrap();
         let uid = claims.get("sub").unwrap().to_owned();
         Outcome::Success(JWT(uid))
