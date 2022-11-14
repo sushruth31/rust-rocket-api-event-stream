@@ -152,6 +152,7 @@ fn refresh(
     };
     match token_map.read(old_refresh_token.as_str()) {
         Some(token) if token_from_header == token && !uid.is_empty() => {
+            //we can only refresh the token if the token from the header is the same as the token in the map
             let new_token = create_jwt_token(&uid, SECRET);
             let new_refresh_token = create_jwt_token(&uid, REFRESH_TOKEN_SECRET);
             //update token in map
@@ -159,7 +160,7 @@ fn refresh(
             token_map.delete(old_refresh_token.as_str());
             json!({ "token": new_token , "refresh_token": new_refresh_token })
         }
-        Some(_) => json!({ "error": "invalid token" }),
+        Some(_) => json!({ "error": "invalid token was provided" }),
         None => json!({ "error": "refresh token not found", "uid": uid }),
     }
 }
