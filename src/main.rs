@@ -99,17 +99,14 @@ fn create_jwt_token(uid: &str, secret: &[u8]) -> String {
 }
 
 impl User {
-    async fn new(user: &UserWoToken, token_map: &State<TokenMap>) -> Result<Self, String> {
+    async fn new(user: &UserWoToken, token_map: &State<RefreshTokens>) -> Result<Self, String> {
         let UserWoToken { uid, password, .. } = user;
         if let Some(user) = validate_user(uid, password).await {
             //return found user with token
             let token = create_jwt_token(&user.uid, SECRET);
             let refresh_token = create_jwt_token(&user.uid, REFRESH_TOKEN_SECRET);
             //write token to map
-            token_map
-                .lock()
-                .unwrap()
-                .insert(refresh_token.clone(), token.clone());
+            token_map.insert(refresh_token.clone(), token.clone());
             Ok(User {
                 uid: user.uid.clone(),
                 name: user.name,
@@ -124,7 +121,7 @@ impl User {
 
 //login route to get a token
 #[post("/login", data = "<user>")]
-async fn login(user: Form<UserWoToken>, token_map: &State<TokenMap>) -> String {
+async fn login(user: Form<UserWoToken>, token_map: &State<RefreshTokens>) -> String {
     match User::new(&user, token_map).await {
         Ok(user) => serde_json::to_string(&user).unwrap(),
         Err(e) => e,
@@ -133,10 +130,9 @@ async fn login(user: Form<UserWoToken>, token_map: &State<TokenMap>) -> String {
 
 //refresh token route
 #[post("/refresh", data = "<refresh_token>")]
-fn refresh(refresh_token: Form<String>, token_map: &State<TokenMap>) -> serde_json::Value {
-    let mut token_map = token_map.lock().unwrap();
+fn refresh(refresh_token: Form<String>, token_map: &State<RefreshTokens>) -> serde_json::Value {
     let old_refresh_token = refresh_token.into_inner();
-    match token_map.get(&old_refresh_token) {
+    match token_map.read(old_refresh_token.as_str()) {
         Some(token) => {
             let new_token = create_jwt_token(&token, SECRET);
             //update token in map
@@ -215,10 +211,22 @@ impl<'r> FromRequest<'r> for JWT {
 
 //state to hold the list of refresh tokens
 //ideally this should be a database
-type TokenMap = Arc<Mutex<HashMap<String, String>>>;
+type TokenMap = Mutex<HashMap<String, String>>;
 
-struct RefreshTokens {
-    tokens: TokenMap,
+struct RefreshTokens(TokenMap);
+
+impl RefreshTokens {
+    fn new() -> Self {
+        RefreshTokens(Mutex::new(HashMap::new()))
+    }
+    fn insert(&self, refresh_token: String, token: String) {
+        let mut map = self.0.lock().unwrap();
+        map.insert(refresh_token, token);
+    }
+    fn read(&self, refresh_token: &str) -> Option<String> {
+        let map = self.0.lock().unwrap();
+        map.get(refresh_token).map(|s| s.to_string())
+    }
 }
 
 fn rocket() -> rocket::Rocket<rocket::Build> {
@@ -230,9 +238,7 @@ fn rocket() -> rocket::Rocket<rocket::Build> {
     rocket
         .mount("/", routes![test, login, post, stream, refresh])
         .manage(channel::<Message>(1024).0)
-        .manage(RefreshTokens {
-            tokens: Arc::new(Mutex::new(HashMap::new())),
-        })
+        .manage(RefreshTokens::new())
         .attach(AdHoc::config::<Config>())
 }
 
