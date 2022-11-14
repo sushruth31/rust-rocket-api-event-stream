@@ -58,6 +58,12 @@ struct UserWoToken {
     password: String,
 }
 
+#[derive(Clone, Debug, FromForm, Serialize, Deserialize)]
+#[serde(crate = "rocket::serde")]
+struct RefreshTokenPayload {
+    refresh_token: String,
+}
+
 const SECRET: &[u8] = b"secret";
 const REFRESH_TOKEN_SECRET: &[u8] = b"refresh_token_secret";
 
@@ -130,16 +136,27 @@ async fn login(user: Form<UserWoToken>, token_map: &State<RefreshTokens>) -> Str
 
 //refresh token route
 #[post("/refresh", data = "<refresh_token>")]
-fn refresh(refresh_token: Form<String>, token_map: &State<RefreshTokens>) -> serde_json::Value {
-    let old_refresh_token = refresh_token.into_inner();
+fn refresh(
+    refresh_token: Form<RefreshTokenPayload>,
+    token_map: &State<RefreshTokens>,
+    _uid: JWT,
+) -> serde_json::Value {
+    let old_refresh_token = refresh_token.into_inner().refresh_token;
     match token_map.read(old_refresh_token.as_str()) {
         Some(token) => {
             let new_token = create_jwt_token(&token, SECRET);
+            let new_refresh_token = create_jwt_token(&token, REFRESH_TOKEN_SECRET);
             //update token in map
-            token_map.insert(old_refresh_token, new_token.clone());
-            json!({ "token": new_token })
+            token_map.insert(new_refresh_token.clone(), new_token.clone());
+            token_map.delete(old_refresh_token.as_str());
+            json!({ "token": new_token , "refresh_token": new_refresh_token })
         }
-        None => json!({ "error": "refresh token not found" }),
+        None => {
+            for (key, val) in token_map.read_all() {
+                println!("{}: {}", key, val);
+            }
+            json!({ "error": "refresh token not found" })
+        }
     }
 }
 
@@ -227,19 +244,26 @@ impl RefreshTokens {
         let map = self.0.lock().unwrap();
         map.get(refresh_token).map(|s| s.to_string())
     }
+
+    fn read_all(&self) -> Vec<(String, String)> {
+        let map = self.0.lock().unwrap();
+        map.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+    fn delete(&self, refresh_token: &str) {
+        let mut map = self.0.lock().unwrap();
+        map.remove(refresh_token);
+    }
 }
 
 fn rocket() -> rocket::Rocket<rocket::Build> {
     let rocket = rocket::build();
-    let figment = rocket.figment();
-
-    let _config: Config = figment.extract().expect("config");
 
     rocket
         .mount("/", routes![test, login, post, stream, refresh])
         .manage(channel::<Message>(1024).0)
         .manage(RefreshTokens::new())
-        .attach(AdHoc::config::<Config>())
 }
 
 #[rocket::main]
