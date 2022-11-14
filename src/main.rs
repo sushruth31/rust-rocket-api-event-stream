@@ -53,8 +53,11 @@ struct User {
 #[derive(Clone, Debug, FromForm, Serialize, Deserialize)]
 #[serde(crate = "rocket::serde")]
 struct UserWoToken {
+    #[field(validate = len(1..).or_else(msg!("uid is required")))]
     uid: String,
+    #[field(validate = len(1..))]
     name: String,
+    #[field(validate = len(1..))]
     password: String,
 }
 
@@ -139,29 +142,30 @@ async fn login(user: Form<UserWoToken>, token_map: &State<RefreshTokens>) -> Str
 fn refresh(
     refresh_token: Form<RefreshTokenPayload>,
     token_map: &State<RefreshTokens>,
-    _uid: JWT,
+    token_from_header: JWT,
 ) -> serde_json::Value {
     let old_refresh_token = refresh_token.into_inner().refresh_token;
+    let token_from_header = token_from_header.0;
+    let uid = match get_fields_from_token(&token_from_header) {
+        Some((uid, _)) => uid,
+        None => "".to_string(),
+    };
     match token_map.read(old_refresh_token.as_str()) {
-        Some(token) => {
-            let new_token = create_jwt_token(&token, SECRET);
-            let new_refresh_token = create_jwt_token(&token, REFRESH_TOKEN_SECRET);
+        Some(token) if token_from_header == token && !uid.is_empty() => {
+            let new_token = create_jwt_token(&uid, SECRET);
+            let new_refresh_token = create_jwt_token(&uid, REFRESH_TOKEN_SECRET);
             //update token in map
             token_map.insert(new_refresh_token.clone(), new_token.clone());
             token_map.delete(old_refresh_token.as_str());
             json!({ "token": new_token , "refresh_token": new_refresh_token })
         }
-        None => {
-            for (key, val) in token_map.read_all() {
-                println!("{}: {}", key, val);
-            }
-            json!({ "error": "refresh token not found" })
-        }
+        Some(_) => json!({ "error": "invalid token" }),
+        None => json!({ "error": "refresh token not found", "uid": uid }),
     }
 }
 
 #[post("/message", data = "<form>")]
-fn post(form: Form<Message>, sender: &State<Sender<Message>>, uid: JWT) -> serde_json::Value {
+fn post(form: Form<Message>, sender: &State<Sender<Message>>, _token: JWT) -> serde_json::Value {
     let form = form.into_inner();
     //may fail if no one is listening
     let res = sender.send(form.clone());
@@ -175,7 +179,7 @@ fn post(form: Form<Message>, sender: &State<Sender<Message>>, uid: JWT) -> serde
 }
 
 #[get("/stream")]
-async fn stream(sender: &State<Sender<Message>>, _uid: JWT) -> EventStream![] {
+async fn stream(sender: &State<Sender<Message>>, _token: JWT) -> EventStream![] {
     let mut rx = sender.subscribe();
     EventStream! {
         loop {
@@ -202,27 +206,33 @@ impl<'r> FromRequest<'r> for JWT {
                 ))
             }
         };
-        if token_str.is_empty() {
-            return Outcome::Failure((rocket::http::Status::Unauthorized, "No token".to_string()));
-        }
-        let key: Hmac<Sha256> = Hmac::new_from_slice(SECRET).unwrap();
-        let claims: BTreeMap<String, String> = token_str.verify_with_key(&key).unwrap();
-        let uid = claims.get("sub").unwrap().to_owned();
-        //check if token is expired
-        let exp = claims
-            .get("iat")
-            .unwrap()
-            .to_owned()
-            .parse::<i64>()
-            .unwrap();
-        let now = Utc::now().timestamp();
-        if exp < now {
-            return Outcome::Failure((
+        if let Some((_, exp)) = get_fields_from_token(&token_str) {
+            let exp = exp.parse::<i64>().unwrap();
+            let now = Utc::now().timestamp();
+            if exp < now {
+                return Outcome::Failure((
+                    rocket::http::Status::Unauthorized,
+                    "Token expired".to_string(),
+                ));
+            }
+            Outcome::Success(JWT(token_str))
+        } else {
+            Outcome::Failure((
                 rocket::http::Status::Unauthorized,
-                "Token expired".to_string(),
-            ));
+                "Invalid token".to_string(),
+            ))
         }
-        Outcome::Success(JWT(uid))
+    }
+}
+fn get_fields_from_token(token: &str) -> Option<(String, String)> {
+    if token.is_empty() {
+        None
+    } else {
+        let key: Hmac<Sha256> = Hmac::new_from_slice(SECRET).unwrap();
+        let claims: BTreeMap<String, String> = token.verify_with_key(&key).unwrap();
+        let uid = claims.get("sub").unwrap().to_owned();
+        let exp = claims.get("iat").unwrap().to_owned();
+        Some((uid, exp))
     }
 }
 
